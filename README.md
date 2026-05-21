@@ -1,289 +1,109 @@
-# Alecto V1 HTTP-Client ESP32
+# esp32_alecto
 
-Этот проект представляет собой скетч для ESP32, который принимает показания с внешнего датчика Alecto V1 (температура, влажность, уровень батареи), фильтрует повторяющиеся данные и отправляет уникальные пакеты на сервер методом HTTP POST.
+ESP32 sketch that listens for an Alecto V1 wireless weather sensor on a GPIO line and forwards each new reading to an HTTP endpoint as a form POST.
 
----
+![platform](https://img.shields.io/badge/platform-ESP32-blue) ![framework](https://img.shields.io/badge/framework-Arduino-orange) ![license](https://img.shields.io/badge/license-MIT-green)
 
-## Оглавление
+## What it does
 
-1. [Назначение](#назначение)  
-2. [Требования](#требования)  
-3. [Оборудование и подключение](#оборудование-и-подключение)  
-4. [Установка библиотек](#установка-библиотек)  
-5. [Настройка конфигурации](#настройка-конфигурации)  
-6. [Описание работы кода](#описание-работы-кода)  
-7. [Шаги по загрузке](#шаги-по-загрузке)  
-8. [Пример серверного скрипта (PHP)](#пример-серверного-скрипта-php)  
-9. [Отладка и проверка](#отладка-и-проверка)  
-10. [Лицензия](#лицензия)  
+The Alecto V1 sensor broadcasts on 433 MHz. With a cheap receiver wired into GPIO 5, the [WeatherStationDataRx](https://github.com/bbx10/WeatherStationDataRx) library decodes the packets. This sketch keeps the last forwarded reading in memory, de-duplicates incoming packets, and POSTs the new ones to a URL of your choice (`id`, `ch`, `t`, `h`, `bat` as form fields). A reference PHP receiver is included below.
 
----
+It's a one-evening project — no OTA, no MQTT, no TLS. Use it on a trusted LAN.
 
-## Назначение
+## Hardware
 
-- Считать данные (ID датчика, температура, влажность, уровень батареи) с беспроводного внешнего датчика Alecto V1, подключённого к ESP32 через проводной интерфейс (прямое подключение DATA-пина).
-- Фильтровать повторяющиеся пакеты, чтобы на сервер отправлялись только новые показания (изменившиеся ID или хотя бы одно поле данных).
-- Отправлять уникальные данные на удалённый сервер при помощи HTTP POST-запроса (формат `application/x-www-form-urlencoded`).
+| Part | Notes | Approx. cost |
+| --- | --- | --- |
+| ESP32 dev board (any Arduino-core variant) | DevKitC, Wemos, NodeMCU-32 | $5 |
+| Alecto V1 outdoor sensor | Temperature + humidity, 433 MHz | $15 |
+| 433 MHz RX module (RXB6 or similar) | Superheterodyne preferred over regen | $3 |
 
----
+Wiring:
 
-## Требования
+```
+Alecto V1 (433 MHz)  ))) ))) (((  RXB6 DATA ──► GPIO 5 (ESP32)
+                                       VCC ──► 3.3 V
+                                       GND ──► GND
+```
 
-1. **Плата ESP32** (любой распространённый вариант, поддерживающий Arduino Core).
-2. **Внешний датчик Alecto V1** (беспроводной датчик «температура + влажность»).
-3. **Провода для соединения** (DATA-пин датчика ↔ GPIO 5 ESP32).
-4. **Интернет-соединение** (Wi-Fi SSID и пароль).
-5. **Сервер с PHP** (скрипт `weather_log.php` для приёма POST-запросов).
-6. **Arduino IDE** (или PlatformIO) с установленными библиотеками.
+## Quickstart (PlatformIO)
 
----
+```bash
+git clone https://github.com/egerkuzma/esp32_alecto.git
+cd esp32_alecto
+cp include/secrets.h.example include/secrets.h
+# edit include/secrets.h with your Wi-Fi + server URL
+pio run -t upload
+pio device monitor
+```
 
-## Оборудование и подключение
+Or in Arduino IDE: install the **WeatherStationDataRx** library via Library Manager, open `src/main.cpp` as a sketch (rename to `.ino`), and create a `secrets.h` next to it.
 
-- **DATA-пин датчика Alecto V1**  →  **GPIO 5 (D5) ESP32**  
-  > Важно убедиться, что питание самого датчика включено и он находится в пределах зоны приёма, а DATA-вывод датчика свободно соединён с GPIO 5.  
+## Configuration
 
-- **Питание ESP32**  →  **5 V (через USB-кабель или VIN) / 3.3 V**  
-  > Рекомендуется подавать 5 V на VIN (USB-разъём), чтобы на 3.3 V пины поступало стабильное напряжение.  
+Edit `include/secrets.h` (gitignored). Three values:
 
-- **GND (земля)**  →  **GND**  
-  > Общая земля между ESP32 и датчиком обязательна.
+| Define | Meaning |
+| --- | --- |
+| `WIFI_SSID` | Your network SSID |
+| `WIFI_PASS` | Your network password |
+| `SERVER_URL` | HTTP endpoint to POST readings to |
 
-Пример схемы (упрощённо):
+## How it works
 
-\`\`\`
-  [Alecto V1 Sensor]
-      ┌─────────┐
-      │  DATA   │─────────> GPIO 5 (ESP32)
-      │  VCC    │── 3.3 V │ (или 5 V → VIN, зависит от модели)
-      │  GND    │── GND   │
-      └─────────┘
+1. `WeatherStationDataRx::readData()` returns a packet type (`'T'` = temp + humidity, others ignored here).
+2. The sketch compares ID, temperature (±0.05 °C), humidity, and battery flag against the last forwarded reading.
+3. If anything changed, it POSTs `id=…&ch=0&t=…&h=…&bat=…` to `SERVER_URL`.
+4. Wi-Fi is checked before every POST and reconnected if dropped.
 
-  [ESP32]
-      ┌──────────────────────────┐
-      │    GPIO 5  (INPUT)       │◄── DATA-пин датчика
-      │    VIN / USB 5 V         │── (питание плата ESP32)
-      │    3V3                   │── (при подключении датчика напрямую)
-      │    GND                   │── (общая земля)
-      └──────────────────────────┘
-\`\`\`
+## Example PHP receiver
 
----
-
-## Установка библиотек
-
-1. **Arduino IDE** (или **PlatformIO**) должен быть настроен на работу с ESP32.  
-   - В Arduino IDE:  
-     - Откройте **Файл → Настройки**.  
-     - В поле «Дополнительные ссылки для менеджера плат» добавьте:  
-       \`\`\`
-       https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-       \`\`\`
-     - Затем откройте **Инструменты → Плата: … → Менеджер плат**, найдите «esp32» и установите.  
-
-2. **Библиотека WeatherStationDataRx**  
-   - В Arduino IDE:  
-     - Откройте **Скетч → Подключить библиотеку → Управление библиотеками…**.  
-     - В поле поиска введите \`WeatherStationDataRx\`.  
-     - Установите последнюю версию.  
-
-3. **Стандартные библиотеки**  
-   - \`WiFi.h\` и \`HTTPClient.h\` входят в пакет Arduino-ESP32 и дополнительных установок не требуют.
-
----
-
-## Настройка конфигурации
-
-В коде необходимо указать свои данные Wi-Fi и адрес сервера. Найдите раздел:
-
-\`\`\`cpp
-// === Настройка Wi-Fi ===
-const char* WIFI_SSID = "TP-Link_5BAF";
-const char* WIFI_PASS = "53541437";
-
-// URL до вашего PHP-скрипта
-const char* SERVER_URL = "http://my.host/weather_log.php";
-\`\`\`
-
-1. Замените \`WIFI_SSID\` на название вашей сети (SSID).  
-2. Замените \`WIFI_PASS\` на пароль от вашей сети.  
-3. Укажите корректный URL вашего PHP-скрипта, который будет принимать POST-запросы вида:  
-   \`\`\`
-   id=<ID_датчика>&ch=<канал>&t=<температура>&h=<влажность>&bat=<уровень_батареи>
-   \`\`\`
-
----
-
-## Описание работы кода
-
-1. **Глобальные переменные для фильтрации дубликатов**  
-   - \`last_id\`, \`last_temp\`, \`last_humidity\`, \`last_battery\`  
-   Они хранят последнее отправленное значение каждого поля; если новые данные совпадают со старыми (с учётом небольшой погрешности для температуры), отправка пропускается.
-
-2. **Инициализация (функция \`setup()\`)**  
-   - Запуск Serial-монитора на скорости 115200.  
-   - Подключение к Wi-Fi с индикацией «точек» в Serial до установления соединения.  
-   - После подключения выводится IP-адрес ESP32.  
-   - Запуск приёма данных от датчика Alecto V1 (\`wsdr.begin()\`).
-
-3. **Основной цикл (функция \`loop()\`)**  
-   - Вызывается \`wsdr.readData()\`, который возвращает символ типа пакета:  
-     - \`'T'\` – пакет с температурой и влажностью.  
-     - \`'W'\` – пакет ветра (не обрабатывается в данном скетче).  
-     - \`'R'\` – пакет с данными о дожде.  
-     - \`'B'\` – событие нажатия кнопки на пульте датчика.  
-     - \`0\` – новых данных пока нет.  
-   - Если \`t == 'T'\`, считываются:  
-     - \`sensor_id = wsdr.sensorID()\` – уникальный ID датчика (16 бит).  
-     - \`temperature = wsdr.readTemperature()\` – температура, °C (тип \`float\`).  
-     - \`humidity = wsdr.readHumidity()\` – влажность, %.  
-     - \`battery_level = wsdr.batteryStatus() ? 1 : 0\` – уровень батареи (1 – низкий, 0 – нормальный).  
-     - \`sensor_ch\` – канал, здесь по умолчанию \`0\` (если у вас несколько каналов, нужно задать соответствующую логику).  
-   - Проверка, является ли принятый пакет новым:  
-     \`\`\`cpp
-     bool isNew =
-       (sensor_id    != last_id)    ||
-       (fabs(temperature - last_temp) > 0.05f) ||
-       (humidity      != last_humidity) ||
-       (battery_level != last_battery);
-     \`\`\`  
-   - Если данные **новые**:  
-     1. Сохраняем текущие значения в \`last_*\`.  
-     2. Выводим их в Serial: \`Новый пакет: ID:<…> T:<…>°C H:<…>% Bat:<…>\`.  
-     3. Если ESP32 подключён к Wi-Fi, формируем HTTP-клиент (\`HTTPClient http;\`), указываем URL (\`http.begin(SERVER_URL);\`) и заголовок \`Content-Type: application/x-www-form-urlencoded\`.  
-     4. Собираем строку POST-данных:
-        \`\`\`cpp
-        String postData = "";
-        postData += "id="  + String(sensor_id);
-        postData += "&ch=" + String(sensor_ch);
-        postData += "&t="  + String(temperature, 1);
-        postData += "&h="  + String(humidity);
-        postData += "&bat="+ String(battery_level);
-        \`\`\`  
-     5. Отправляем \`int httpCode = http.POST(postData);\`.  
-        - Если \`httpCode > 0\`, читаем \`payload = http.getString()\` и выводим код ответа и текст.  
-        - Иначе выводим ошибку \`http.errorToString(httpCode)\`.  
-     6. Завершаем запрос через \`http.end()\`.  
-     7. Ждём \`delay(1000)\` мс перед следующим приёмом/передачей.  
-   - Если пакет **не новый** (дубликат), выводим \`Дубликат пакета, отправку пропускаем\`.
-
----
-
-## Шаги по загрузке
-
-1. Откройте **Arduino IDE** (или **PlatformIO**).  
-2. Создайте новый скетч и вставьте туда код из \`main.ino\` (приведённый выше).  
-3. Убедитесь, что в **Инструменты → Плата** выбрана ваша модель ESP32.  
-4. В **Инструменты → Порт** выберите COM-порт, к которому подключена плата.  
-5. Проверьте, что настроены \`WIFI_SSID\`, \`WIFI_PASS\` и \`SERVER_URL\`.  
-6. Нажмите **Загрузить** (Upload).  
-7. Откройте **Монитор порта** (Serial Monitor) на скорости **115200** для отладки.
-
----
-
-## Пример серверного скрипта (PHP)
-
-На стороне сервера должен быть скрипт \`weather_log.php\`, который получает POST-параметры и сохраняет их в базу данных или файл. Вот минимальный пример:
-
-\`\`\`php
+```php
 <?php
-// weather_log.php
+// weather_log.php — minimal MySQL receiver.
+$conn = new mysqli('localhost', getenv('DB_USER'), getenv('DB_PASS'), 'weather_db');
+if ($conn->connect_error) { http_response_code(500); exit('DB down'); }
 
-// Настройка соединения с БД (MySQL, SQLite и т.д.)
-// Здесь пример для MySQL:
-$host     = 'localhost';
-$user     = 'db_user';
-$password = 'db_pass';
-$dbname   = 'weather_db';
-
-$conn = new mysqli($host, $user, $password, $dbname);
-if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
-}
-
-// Получаем POST-параметры
-$sensor_id = isset($_POST['id'])  ? intval($_POST['id']) : null;
-$channel   = isset($_POST['ch'])  ? intval($_POST['ch']) : null;
-$temperature = isset($_POST['t']) ? floatval($_POST['t']) : null;
-$humidity    = isset($_POST['h']) ? intval($_POST['h']) : null;
-$bat_level   = isset($_POST['bat']) ? intval($_POST['bat']) : null;
-
-// Проверка на обязательные поля
-if ($sensor_id === null || $temperature === null || $humidity === null || $bat_level === null) {
-    http_response_code(400);
-    echo "Missing parameters";
-    exit;
-}
-
-// Сохраняем в таблицу `weather_log`:
-// CREATE TABLE IF NOT EXISTS weather_log (
-//   id INT AUTO_INCREMENT PRIMARY KEY,
-//   sensor_id SMALLINT NOT NULL,
-//   channel TINYINT NOT NULL,
-//   temperature FLOAT NOT NULL,
-//   humidity TINYINT NOT NULL,
-//   battery TINYINT NOT NULL,
-//   ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-// );
+$fields = ['id','ch','t','h','bat'];
+foreach ($fields as $f) if (!isset($_POST[$f])) { http_response_code(400); exit("missing $f"); }
 
 $stmt = $conn->prepare(
-    "INSERT INTO weather_log (sensor_id, channel, temperature, humidity, battery) 
-     VALUES (?, ?, ?, ?, ?)"
+  'INSERT INTO weather_log (sensor_id, channel, temperature, humidity, battery)
+   VALUES (?, ?, ?, ?, ?)'
 );
-$stmt->bind_param("iiddi", $sensor_id, $channel, $temperature, $humidity, $bat_level);
+$stmt->bind_param('iidii',
+  $_POST['id'], $_POST['ch'], $_POST['t'], $_POST['h'], $_POST['bat']
+);
+$stmt->execute();
+echo 'OK';
+```
 
-if ($stmt->execute()) {
-    echo "OK";
-} else {
-    http_response_code(500);
-    echo "DB Error: " . $stmt->error;
-}
+Matching schema:
 
-$stmt->close();
-$conn->close();
-?>
-\`\`\`
+```sql
+CREATE TABLE weather_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  sensor_id SMALLINT NOT NULL,
+  channel TINYINT NOT NULL,
+  temperature FLOAT NOT NULL,
+  humidity TINYINT NOT NULL,
+  battery TINYINT NOT NULL,
+  ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
 
-> **Примечание:**  
-> - Перед использованием создайте базу данных и таблицу \`weather_log\` (пример DDL приведён в комментариях).  
-> - Скорректируйте параметры подключения к БД.
+## Limitations
 
----
+- Plain HTTP only — anyone on the LAN can read your readings or fake them.
+- No persistence: a reboot resets the de-dup state, so the first packet after boot is always forwarded.
+- WeatherStationDataRx receiving is timing-sensitive; cheap regen RX modules sometimes drop packets.
+- Only `'T'` (temperature + humidity) packets are forwarded — wind/rain/button events are ignored.
 
-## Отладка и проверка
+## Credits
 
-1. После загрузки скетча откройте **Serial Monitor** (скорость 115200).  
-2. Убедитесь, что ESP32 успешно подключился к Wi-Fi:  
-   ```
-   Подключение к Wi-Fi...
-   Wi-Fi подключён, IP: 192.168.0.112
-   ```
-3. Дождитесь приёма первого «T»-пакета от датчика. Serial выведет, например:  
-   ```
-   Новый пакет: ID:45  T:25.8°C  H:36%  Bat:1
-   POST код: 200, ответ: OK
-   ```
-4. Повторные одинаковые пакеты должны помечаться как «Дубликат пакета, отправку пропускаем».  
-5. На стороне сервера проверьте, что записи попадают в таблицу \`weather_log\` (например, через phpMyAdmin, MySQL CLI или аналог).
+- [WeatherStationDataRx](https://github.com/bbx10/WeatherStationDataRx) — Alecto V1 decoder
+- [arduino-esp32](https://github.com/espressif/arduino-esp32) — Arduino core for ESP32
 
----
+## License
 
-## Лицензия
-
-Этот проект распространяется под лицензией MIT.  
-Свободно используйте, модифицируйте и распространяйте код с указанием авторства.
-
-\`\`\`
-MIT License
-
-© 2025 [Ваше имя]
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-...
-\`\`\`
-
----
-
-> **Автор:** Павел  
-> **Дата:** июнь 2025  
-> **Версия:** 1.0
+MIT — see [LICENSE](LICENSE).
